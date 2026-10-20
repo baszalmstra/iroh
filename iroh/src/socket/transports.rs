@@ -961,6 +961,15 @@ pub(crate) struct TransportsSender {
 }
 
 impl TransportsSender {
+    // noq-udp drops a socket's GSO limit to 1 when the kernel refuses a segmented send.
+    fn current_max_transmit_segments(&self) -> NonZeroUsize {
+        #[cfg(not(wasm_browser))]
+        let ip = self.ip.max_transmit_segments();
+        #[cfg(wasm_browser)]
+        let ip = None;
+        ip.map_or(self.max_transmit_segments, |ip| ip.min(self.max_transmit_segments))
+    }
+
     #[instrument(name = "poll_send", skip(self, cx, transmit), fields(len = transmit.contents.len()))]
     pub(crate) fn poll_send(
         mut self: Pin<&mut Self>,
@@ -1300,7 +1309,7 @@ impl noq::UdpSender for Sender {
     }
 
     fn max_transmit_segments(&self) -> NonZeroUsize {
-        self.sender.max_transmit_segments
+        self.sender.current_max_transmit_segments()
     }
 }
 
