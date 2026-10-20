@@ -13,7 +13,7 @@ use netwatch::{UdpSender, UdpSocket};
 use pin_project::pin_project;
 use tracing::{debug, info, trace};
 
-use super::{RecvInfo, Transmit};
+use super::{RecvInfo, Transmit, canonical_socket_addr};
 use crate::metrics::{EndpointMetrics, SocketMetrics};
 
 #[derive(Debug)]
@@ -133,6 +133,10 @@ impl Config {
                         },
                         SocketAddr::V6(dst_v6),
                     ) => {
+                        if dst_v6.ip().is_unicast_link_local() && dst_v6.scope_id() != 0 {
+                            return ip_net.addr().is_unspecified()
+                                || *scope_id == dst_v6.scope_id();
+                        }
                         if ip_net.contains(dst_v6.ip()) {
                             return true;
                         }
@@ -208,6 +212,7 @@ impl IpTransport {
                 for i in 0..n {
                     let meta = &mut metas[i];
                     let recv_info = &mut recv_infos[i];
+                    Self::apply_recv_interface_scope(meta);
                     if meta.addr.is_ipv4() {
                         // The AsyncUdpSocket is an AF_INET6 socket and needs to show this
                         // as coming from an IPv4-mapped IPv6 addresses, since Noq will
@@ -220,13 +225,24 @@ impl IpTransport {
                     }
                     // The transport addresses are internal to iroh and we always want those
                     // to remain the canonical address.
-                    *recv_info = RecvInfo::from_addr(
-                        SocketAddr::new(meta.addr.ip().to_canonical(), meta.addr.port()).into(),
-                    );
+                    *recv_info = RecvInfo::from_addr(meta.addr.into());
                 }
                 Poll::Ready(Ok(n))
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        }
+    }
+
+    /// Adds the receiving interface as the scope of an IPv6 link-local source.
+    fn apply_recv_interface_scope(meta: &mut noq_udp::RecvMeta) {
+        let Some(interface_index) = meta.interface_index else {
+            return;
+        };
+        let SocketAddr::V6(addr) = &mut meta.addr else {
+            return;
+        };
+        if addr.ip().is_unicast_link_local() {
+            addr.set_scope_id(interface_index);
         }
     }
 
@@ -317,10 +333,10 @@ impl IpSender {
     ///
     /// We may be asked to send IPv4-mapped IPv6 addresses.  But our sockets are configured
     /// to only send their actual family.  So we need to map those back to the canonical
-    /// addresses.
+    /// addresses, keeping the scope of an IPv6 link-local address.
     #[inline]
     fn canonical_addr(addr: SocketAddr) -> SocketAddr {
-        SocketAddr::new(addr.ip().to_canonical(), addr.port())
+        canonical_socket_addr(addr)
     }
 
     pub(super) fn poll_send(
@@ -490,6 +506,46 @@ impl IpTransports {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_canonicalization_preserves_ipv6_scope() {
+        let scoped = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 4242, 9, 7));
+        assert_eq!(
+            IpSender::canonical_addr(scoped),
+            SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 4242, 0, 7))
+        );
+    }
+
+    #[test]
+    fn recv_metadata_uses_interface_as_link_local_scope() {
+        let mut meta = noq_udp::RecvMeta::default();
+        meta.addr = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 4242, 0, 0));
+        meta.interface_index = Some(7);
+
+        IpTransport::apply_recv_interface_scope(&mut meta);
+
+        assert_eq!(
+            meta.addr,
+            SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 4242, 0, 7))
+        );
+    }
+
+    #[test]
+    fn scoped_link_local_destination_matches_interface() {
+        let config = Config::V6 {
+            ip_net: Ipv6Net::new("fe80::1".parse().unwrap(), 64).unwrap(),
+            scope_id: 7,
+            port: 0,
+            is_required: true,
+            is_default: false,
+        };
+        let matching = SocketAddr::V6(SocketAddrV6::new("fe80::2".parse().unwrap(), 4242, 0, 7));
+        let other_interface =
+            SocketAddr::V6(SocketAddrV6::new("fe80::2".parse().unwrap(), 4242, 0, 8));
+
+        assert!(config.is_valid_send_addr(None, matching));
+        assert!(!config.is_valid_send_addr(None, other_interface));
+    }
 
     #[tokio::test]
     async fn test_bind_sorting() -> n0_error::Result {
